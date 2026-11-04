@@ -379,14 +379,37 @@ class AdbConnection {
     int localId = openStreams.length + 1;
     AdbStream stream = AdbStream(localId, this);
     openStreams[localId] = stream;
-    await sendMessage(AdbProtocol.generateOpen(localId, destination));
-    if (await stream.onWriteReady.first.timeout(
-      const Duration(seconds: 10),
-      onTimeout: () => false,
-    )) {
+    final ready = Completer<bool>();
+    // 先订阅再发送，避免快速 OKAY 在发送完成前丢失
+    final readySubscription = stream.onWriteReady.listen((value) {
+      if (value && !ready.isCompleted) ready.complete(true);
+    });
+    final closeSubscription = stream.onPayload.listen(
+      (_) {},
+      onDone: () {
+        if (!ready.isCompleted) ready.complete(false);
+      },
+    );
+    var opened = false;
+    try {
+      await sendMessage(AdbProtocol.generateOpen(localId, destination));
+      opened = await ready.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => false,
+      );
+      if (!opened) {
+        throw Exception('Stream open failed or refused by remote peer');
+      }
       return stream;
-    } else {
-      throw Exception('Stream open failed or refused by remote peer');
+    } finally {
+      await readySubscription.cancel();
+      await closeSubscription.cancel();
+      if (!opened) {
+        if (identical(openStreams[localId], stream)) {
+          openStreams.remove(localId);
+        }
+        stream.close();
+      }
     }
   }
 
